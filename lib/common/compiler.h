@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Yann Collet, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -89,6 +89,7 @@
 #    define FORCE_NOINLINE static
 #  endif
 #endif
+
 
 /* target attribute */
 #ifndef __has_attribute
@@ -195,6 +196,22 @@
 #ifndef STATIC_BMI2
     #define STATIC_BMI2 0
 #endif
+
+/* compile time determination of SIMD support */
+#if !defined(ZSTD_NO_INTRINSICS)
+#  if defined(__SSE2__) || defined(_M_AMD64) || (defined (_M_IX86) && defined(_M_IX86_FP) && (_M_IX86_FP >= 2))
+#    define ZSTD_ARCH_X86_SSE2
+#  endif
+#  if defined(__ARM_NEON) || defined(_M_ARM64)
+#    define ZSTD_ARCH_ARM_NEON
+#  endif
+#
+#  if defined(ZSTD_ARCH_X86_SSE2)
+#    include <emmintrin.h>
+#  elif defined(ZSTD_ARCH_ARM_NEON)
+#    include <arm_neon.h>
+#  endif
+#endif  
 
 /* compat. with non-clang compilers */
 #ifndef __has_builtin

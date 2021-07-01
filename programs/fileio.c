@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Yann Collet, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -25,9 +25,10 @@
 ***************************************/
 #include "platform.h"   /* Large Files support, SET_BINARY_MODE */
 #include "util.h"       /* UTIL_getFileSize, UTIL_isRegularFile, UTIL_isSameFile */
-#include <stdio.h>      /* fprintf, fopen, fread, _fileno, stdin, stdout */
+#include <stdio.h>      /* fprintf, open, fdopen, fread, _fileno, stdin, stdout */
 #include <stdlib.h>     /* malloc, free */
 #include <string.h>     /* strcmp, strlen */
+#include <fcntl.h>      /* O_WRONLY */
 #include <assert.h>
 #include <errno.h>      /* errno */
 #include <limits.h>     /* INT_MAX */
@@ -44,7 +45,7 @@
 
 #define ZSTD_STATIC_LINKING_ONLY   /* ZSTD_magicNumber, ZSTD_frameHeaderSize_max */
 #include "../lib/zstd.h"
-#include "../lib/common/zstd_errors.h"  /* ZSTD_error_frameParameter_windowTooLarge */
+#include "../lib/zstd_errors.h"  /* ZSTD_error_frameParameter_windowTooLarge */
 
 #if defined(ZSTD_GZCOMPRESS) || defined(ZSTD_GZDECOMPRESS)
 #  include <zlib.h>
@@ -73,6 +74,14 @@
 
 #define FNSPACE 30
 
+/* Default file permissions 0666 (modulated by umask) */
+#if !defined(_WIN32)
+/* These macros aren't defined on windows. */
+#define DEFAULT_FILE_PERMISSIONS (S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH)
+#else
+#define DEFAULT_FILE_PERMISSIONS (0666)
+#endif
+
 /*-*************************************
 *  Macros
 ***************************************/
@@ -84,10 +93,10 @@
 
 struct FIO_display_prefs_s {
     int displayLevel;   /* 0 : no display;  1: errors;  2: + result + interaction + warnings;  3: + progression;  4: + information */
-    U32 noProgress;
+    FIO_progressSetting_e progressSetting;
 };
 
-static FIO_display_prefs_t g_display_prefs = {2, 0};
+static FIO_display_prefs_t g_display_prefs = {2, FIO_ps_auto};
 
 #define DISPLAY(...)         fprintf(stderr, __VA_ARGS__)
 #define DISPLAYOUT(...)      fprintf(stdout, __VA_ARGS__)
@@ -96,10 +105,10 @@ static FIO_display_prefs_t g_display_prefs = {2, 0};
 static const U64 g_refreshRate = SEC_TO_MICRO / 6;
 static UTIL_time_t g_displayClock = UTIL_TIME_INITIALIZER;
 
-#define READY_FOR_UPDATE() (!g_display_prefs.noProgress && UTIL_clockSpanMicro(g_displayClock) > g_refreshRate)
+#define READY_FOR_UPDATE() ((g_display_prefs.progressSetting != FIO_ps_never) && UTIL_clockSpanMicro(g_displayClock) > g_refreshRate)
 #define DELAY_NEXT_UPDATE() { g_displayClock = UTIL_getTime(); }
 #define DISPLAYUPDATE(l, ...) {                              \
-        if (g_display_prefs.displayLevel>=l && !g_display_prefs.noProgress) { \
+        if (g_display_prefs.displayLevel>=l && (g_display_prefs.progressSetting != FIO_ps_never)) { \
             if (READY_FOR_UPDATE() || (g_display_prefs.displayLevel>=4)) { \
                 DELAY_NEXT_UPDATE();                         \
                 DISPLAY(__VA_ARGS__);                        \
@@ -298,6 +307,7 @@ struct FIO_prefs_s {
     int blockSize;
     int overlapLog;
     U32 adaptiveMode;
+    U32 useRowMatchFinder;
     int rsyncable;
     int minAdaptLevel;
     int maxAdaptLevel;
@@ -323,6 +333,7 @@ struct FIO_prefs_s {
     int excludeCompressedFiles;
     int patchFromMode;
     int contentSize;
+    int allowBlockDevices;
 };
 
 /*-*************************************
@@ -383,6 +394,7 @@ FIO_prefs_t* FIO_createPreferences(void)
     ret->testMode = 0;
     ret->literalCompressionMode = ZSTD_lcm_auto;
     ret->excludeCompressedFiles = 0;
+    ret->allowBlockDevices = 0;
     return ret;
 }
 
@@ -418,7 +430,7 @@ void FIO_freeContext(FIO_ctx_t* const fCtx)
 
 void FIO_setNotificationLevel(int level) { g_display_prefs.displayLevel=level; }
 
-void FIO_setNoProgress(unsigned noProgress) { g_display_prefs.noProgress = noProgress; }
+void FIO_setProgressSetting(FIO_progressSetting_e setting) { g_display_prefs.progressSetting = setting; }
 
 
 /*-*************************************
@@ -450,6 +462,8 @@ void FIO_setNbWorkers(FIO_prefs_t* const prefs, int nbWorkers) {
 
 void FIO_setExcludeCompressedFile(FIO_prefs_t* const prefs, int excludeCompressedFiles) { prefs->excludeCompressedFiles = excludeCompressedFiles; }
 
+void FIO_setAllowBlockDevices(FIO_prefs_t* const prefs, int allowBlockDevices) { prefs->allowBlockDevices = allowBlockDevices; }
+
 void FIO_setBlockSize(FIO_prefs_t* const prefs, int blockSize) {
     if (blockSize && prefs->nbWorkers==0)
         DISPLAYLEVEL(2, "Setting block size is useless in single-thread mode \n");
@@ -466,6 +480,10 @@ void FIO_setAdaptiveMode(FIO_prefs_t* const prefs, unsigned adapt) {
     if ((adapt>0) && (prefs->nbWorkers==0))
         EXM_THROW(1, "Adaptive mode is not compatible with single thread mode \n");
     prefs->adaptiveMode = adapt;
+}
+
+void FIO_setUseRowMatchFinder(FIO_prefs_t* const prefs, int useRowMatchFinder) {
+    prefs->useRowMatchFinder = useRowMatchFinder;
 }
 
 void FIO_setRsyncable(FIO_prefs_t* const prefs, int rsyncable) {
@@ -588,11 +606,12 @@ static int FIO_removeFile(const char* path)
 }
 
 /** FIO_openSrcFile() :
- *  condition : `srcFileName` must be non-NULL.
+ *  condition : `srcFileName` must be non-NULL. `prefs` may be NULL.
  * @result : FILE* to `srcFileName`, or NULL if it fails */
-static FILE* FIO_openSrcFile(const char* srcFileName)
+static FILE* FIO_openSrcFile(const FIO_prefs_t* const prefs, const char* srcFileName)
 {
     stat_t statbuf;
+    int allowBlockDevices = prefs != NULL ? prefs->allowBlockDevices : 0;
     assert(srcFileName != NULL);
     if (!strcmp (srcFileName, stdinmark)) {
         DISPLAYLEVEL(4,"Using stdin for input \n");
@@ -608,6 +627,7 @@ static FILE* FIO_openSrcFile(const char* srcFileName)
 
     if (!UTIL_isRegularFileStat(&statbuf)
      && !UTIL_isFIFOStat(&statbuf)
+     && !(allowBlockDevices && UTIL_isBlockDevStat(&statbuf))
     ) {
         DISPLAYLEVEL(1, "zstd: %s is not a regular file -- ignored \n",
                         srcFileName);
@@ -626,7 +646,8 @@ static FILE* FIO_openSrcFile(const char* srcFileName)
  * @result : FILE* to `dstFileName`, or NULL if it fails */
 static FILE*
 FIO_openDstFile(FIO_ctx_t* fCtx, FIO_prefs_t* const prefs,
-                const char* srcFileName, const char* dstFileName)
+                const char* srcFileName, const char* dstFileName,
+                const int mode)
 {
     if (prefs->testMode) return NULL;  /* do not open file in test mode */
 
@@ -653,7 +674,6 @@ FIO_openDstFile(FIO_ctx_t* fCtx, FIO_prefs_t* const prefs,
 
     if (UTIL_isRegularFile(dstFileName)) {
         /* Check if destination file already exists */
-        FILE* const fCheck = fopen( dstFileName, "rb" );
 #if !defined(_WIN32)
         /* this test does not work on Windows :
          * `NUL` and `nul` are detected as regular files */
@@ -662,31 +682,41 @@ FIO_openDstFile(FIO_ctx_t* fCtx, FIO_prefs_t* const prefs,
                         dstFileName);
         }
 #endif
-        if (fCheck != NULL) {  /* dst file exists, authorization prompt */
-            fclose(fCheck);
-            if (!prefs->overwrite) {
-                if (g_display_prefs.displayLevel <= 1) {
-                    /* No interaction possible */
-                    DISPLAY("zstd: %s already exists; not overwritten  \n",
-                            dstFileName);
-                    return NULL;
-                }
-                DISPLAY("zstd: %s already exists; ", dstFileName);
-                if (UTIL_requireUserConfirmation("overwrite (y/n) ? ", "Not overwritten  \n", "yY", fCtx->hasStdinInput))
-                    return NULL;
+        if (!prefs->overwrite) {
+            if (g_display_prefs.displayLevel <= 1) {
+                /* No interaction possible */
+                DISPLAY("zstd: %s already exists; not overwritten  \n",
+                        dstFileName);
+                return NULL;
             }
-            /* need to unlink */
-            FIO_removeFile(dstFileName);
-    }   }
+            DISPLAY("zstd: %s already exists; ", dstFileName);
+            if (UTIL_requireUserConfirmation("overwrite (y/n) ? ", "Not overwritten  \n", "yY", fCtx->hasStdinInput))
+                return NULL;
+        }
+        /* need to unlink */
+        FIO_removeFile(dstFileName);
+    }
 
-    {   FILE* const f = fopen( dstFileName, "wb" );
+    {
+#if defined(_WIN32)
+        /* Windows requires opening the file as a "binary" file to avoid
+         * mangling. This macro doesn't exist on unix. */
+        const int openflags = O_WRONLY|O_CREAT|O_TRUNC|O_BINARY;
+        const int fd = _open(dstFileName, openflags, mode);
+        FILE* f = NULL;
+        if (fd != -1) {
+            f = _fdopen(fd, "wb");
+        }
+#else
+        const int openflags = O_WRONLY|O_CREAT|O_TRUNC;
+        const int fd = open(dstFileName, openflags, mode);
+        FILE* f = NULL;
+        if (fd != -1) {
+            f = fdopen(fd, "wb");
+        }
+#endif
         if (f == NULL) {
             DISPLAYLEVEL(1, "zstd: %s: %s\n", dstFileName, strerror(errno));
-        } else if (srcFileName != NULL
-               && strcmp (srcFileName, stdinmark)
-               && strcmp(dstFileName, nulmark) ) {
-            /* reduce rights on newly created dst file while compression is ongoing */
-            UTIL_chmod(dstFileName, NULL, 00600);
         }
         return f;
     }
@@ -921,7 +951,7 @@ static void FIO_adjustParamsForPatchFromMode(FIO_prefs_t* const prefs,
     FIO_adjustMemLimitForPatchFromMode(prefs, dictSize, maxSrcFileSize);
     if (fileWindowLog > ZSTD_WINDOWLOG_MAX)
         DISPLAYLEVEL(1, "Max window log exceeded by file (compression ratio will suffer)\n");
-    comprParams->windowLog = MIN(ZSTD_WINDOWLOG_MAX, fileWindowLog);
+    comprParams->windowLog = MAX(ZSTD_WINDOWLOG_MIN, MIN(ZSTD_WINDOWLOG_MAX, fileWindowLog));
     if (fileWindowLog > ZSTD_cycleLog(cParams.chainLog, cParams.strategy)) {
         if (!prefs->ldmFlag)
             DISPLAYLEVEL(1, "long mode automatically triggered\n");
@@ -989,6 +1019,7 @@ static cRess_t FIO_createCResources(FIO_prefs_t* const prefs,
     if (prefs->ldmHashRateLog != FIO_LDM_PARAM_NOTSET) {
         CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_ldmHashRateLog, prefs->ldmHashRateLog) );
     }
+    CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_useRowMatchFinder, prefs->useRowMatchFinder));
     /* compression parameters */
     CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_windowLog, (int)comprParams.windowLog) );
     CHECK( ZSTD_CCtx_setParameter(ress.cctx, ZSTD_c_chainLog, (int)comprParams.chainLog) );
@@ -1311,6 +1342,7 @@ FIO_compressZstdFrame(FIO_ctx_t* const fCtx,
     unsigned inputPresented = 0;
     unsigned inputBlocked = 0;
     unsigned lastJobID = 0;
+    UTIL_HumanReadableSize_t const file_hrs = UTIL_makeHumanReadableSize(fileSize);
 
     DISPLAYLEVEL(6, "compression using zstd format \n");
 
@@ -1321,6 +1353,7 @@ FIO_compressZstdFrame(FIO_ctx_t* const fCtx,
       /* unknown source size; use the declared stream size */
       CHECK( ZSTD_CCtx_setPledgedSrcSize(ress.cctx, prefs->streamSrcSize) );
     }
+
     (void)srcFileName;
 
     /* Main compression loop */
@@ -1364,33 +1397,37 @@ FIO_compressZstdFrame(FIO_ctx_t* const fCtx,
             if (READY_FOR_UPDATE()) {
                 ZSTD_frameProgression const zfp = ZSTD_getFrameProgression(ress.cctx);
                 double const cShare = (double)zfp.produced / (double)(zfp.consumed + !zfp.consumed/*avoid div0*/) * 100;
+                UTIL_HumanReadableSize_t const buffered_hrs = UTIL_makeHumanReadableSize(zfp.ingested - zfp.consumed);
+                UTIL_HumanReadableSize_t const consumed_hrs = UTIL_makeHumanReadableSize(zfp.consumed);
+                UTIL_HumanReadableSize_t const produced_hrs = UTIL_makeHumanReadableSize(zfp.produced);
 
                 /* display progress notifications */
                 if (g_display_prefs.displayLevel >= 3) {
-                    DISPLAYUPDATE(3, "\r(L%i) Buffered :%4u MB - Consumed :%4u MB - Compressed :%4u MB => %.2f%% ",
+                    DISPLAYUPDATE(3, "\r(L%i) Buffered :%6.*f%4s - Consumed :%6.*f%4s - Compressed :%6.*f%4s => %.2f%% ",
                                 compressionLevel,
-                                (unsigned)((zfp.ingested - zfp.consumed) >> 20),
-                                (unsigned)(zfp.consumed >> 20),
-                                (unsigned)(zfp.produced >> 20),
+                                buffered_hrs.precision, buffered_hrs.value, buffered_hrs.suffix,
+                                consumed_hrs.precision, consumed_hrs.value, consumed_hrs.suffix,
+                                produced_hrs.precision, produced_hrs.value, produced_hrs.suffix,
                                 cShare );
-                } else {   /* summarized notifications if == 2 */
-                    DISPLAYLEVEL(2, "\r%79s\r", "");    /* Clear out the current displayed line */
+                } else if (g_display_prefs.displayLevel >= 2 || g_display_prefs.progressSetting == FIO_ps_always) {
+                    /* Require level 2 or forcibly displayed progress counter for summarized updates */
+                    DISPLAYLEVEL(1, "\r%79s\r", "");    /* Clear out the current displayed line */
                     if (fCtx->nbFilesTotal > 1) {
                         size_t srcFileNameSize = strlen(srcFileName);
                         /* Ensure that the string we print is roughly the same size each time */
                         if (srcFileNameSize > 18) {
                             const char* truncatedSrcFileName = srcFileName + srcFileNameSize - 15;
-                            DISPLAYLEVEL(2, "Compress: %u/%u files. Current: ...%s ",
-                                         fCtx->currFileIdx+1, fCtx->nbFilesTotal, truncatedSrcFileName);
+                            DISPLAYLEVEL(1, "Compress: %u/%u files. Current: ...%s ",
+                                        fCtx->currFileIdx+1, fCtx->nbFilesTotal, truncatedSrcFileName);
                         } else {
-                            DISPLAYLEVEL(2, "Compress: %u/%u files. Current: %*s ",
-                                         fCtx->currFileIdx+1, fCtx->nbFilesTotal, (int)(18-srcFileNameSize), srcFileName);
+                            DISPLAYLEVEL(1, "Compress: %u/%u files. Current: %*s ",
+                                        fCtx->currFileIdx+1, fCtx->nbFilesTotal, (int)(18-srcFileNameSize), srcFileName);
                         }
                     }
-                    DISPLAYLEVEL(2, "Read : %2u ", (unsigned)(zfp.consumed >> 20));
+                    DISPLAYLEVEL(1, "Read:%6.*f%4s ", consumed_hrs.precision, consumed_hrs.value, consumed_hrs.suffix);
                     if (fileSize != UTIL_FILESIZE_UNKNOWN)
-                        DISPLAYLEVEL(2, "/ %2u ", (unsigned)(fileSize >> 20));
-                    DISPLAYLEVEL(2, "MB ==> %2.f%%", cShare);
+                        DISPLAYLEVEL(2, "/%6.*f%4s", file_hrs.precision, file_hrs.value, file_hrs.suffix);
+                    DISPLAYLEVEL(1, " ==> %2.f%%", cShare);
                     DELAY_NEXT_UPDATE();
                 }
 
@@ -1512,7 +1549,7 @@ FIO_compressFilename_internal(FIO_ctx_t* const fCtx,
     U64 readsize = 0;
     U64 compressedfilesize = 0;
     U64 const fileSize = UTIL_getFileSize(srcFileName);
-    DISPLAYLEVEL(5, "%s: %u bytes \n", srcFileName, (unsigned)fileSize);
+    DISPLAYLEVEL(5, "%s: %llu bytes \n", srcFileName, (unsigned long long)fileSize);
 
     /* compression format selection */
     switch (prefs->compressionType) {
@@ -1560,16 +1597,20 @@ FIO_compressFilename_internal(FIO_ctx_t* const fCtx,
     if (g_display_prefs.displayLevel >= 2 &&
         !fCtx->hasStdoutOutput &&
         (g_display_prefs.displayLevel >= 3 || fCtx->nbFilesTotal <= 1)) {
+        UTIL_HumanReadableSize_t hr_isize = UTIL_makeHumanReadableSize((U64) readsize);
+        UTIL_HumanReadableSize_t hr_osize = UTIL_makeHumanReadableSize((U64) compressedfilesize);
         if (readsize == 0) {
-            DISPLAYLEVEL(2,"%-20s :  (%6llu => %6llu bytes, %s) \n",
+            DISPLAYLEVEL(2,"%-20s :  (%6.*f%4s => %6.*f%4s, %s) \n",
                 srcFileName,
-                (unsigned long long)readsize, (unsigned long long) compressedfilesize,
+                hr_isize.precision, hr_isize.value, hr_isize.suffix,
+                hr_osize.precision, hr_osize.value, hr_osize.suffix,
                 dstFileName);
         } else {
-            DISPLAYLEVEL(2,"%-20s :%6.2f%%   (%6llu => %6llu bytes, %s) \n",
+            DISPLAYLEVEL(2,"%-20s :%6.2f%%   (%6.*f%4s => %6.*f%4s, %s) \n",
                 srcFileName,
                 (double)compressedfilesize / (double)readsize * 100,
-                (unsigned long long)readsize, (unsigned long long) compressedfilesize,
+                hr_isize.precision, hr_isize.value, hr_isize.suffix,
+                hr_osize.precision, hr_osize.value, hr_osize.suffix,
                 dstFileName);
         }
     }
@@ -1606,23 +1647,24 @@ static int FIO_compressFilename_dstFile(FIO_ctx_t* const fCtx,
     int closeDstFile = 0;
     int result;
     stat_t statbuf;
-    int transfer_permissions = 0;
     assert(ress.srcFile != NULL);
     if (ress.dstFile == NULL) {
+        int dstFilePermissions = DEFAULT_FILE_PERMISSIONS;
+        if ( strcmp (srcFileName, stdinmark)
+          && UTIL_stat(srcFileName, &statbuf)
+          && UTIL_isRegularFileStat(&statbuf) ) {
+            dstFilePermissions = statbuf.st_mode;
+        }
+
         closeDstFile = 1;
         DISPLAYLEVEL(6, "FIO_compressFilename_dstFile: opening dst: %s \n", dstFileName);
-        ress.dstFile = FIO_openDstFile(fCtx, prefs, srcFileName, dstFileName);
+        ress.dstFile = FIO_openDstFile(fCtx, prefs, srcFileName, dstFileName, dstFilePermissions);
         if (ress.dstFile==NULL) return 1;  /* could not open dstFileName */
         /* Must only be added after FIO_openDstFile() succeeds.
          * Otherwise we may delete the destination file if it already exists,
          * and the user presses Ctrl-C when asked if they wish to overwrite.
          */
         addHandler(dstFileName);
-
-        if ( strcmp (srcFileName, stdinmark)
-          && UTIL_stat(srcFileName, &statbuf)
-          && UTIL_isRegularFileStat(&statbuf) )
-            transfer_permissions = 1;
     }
 
     result = FIO_compressFilename_internal(fCtx, prefs, ress, dstFileName, srcFileName, compressionLevel);
@@ -1642,11 +1684,6 @@ static int FIO_compressFilename_dstFile(FIO_ctx_t* const fCtx,
           && strcmp(dstFileName, stdoutmark)  /* special case : don't remove() stdout */
           ) {
             FIO_removeFile(dstFileName); /* remove compression artefact; note don't do anything special if remove() fails */
-        } else if (transfer_permissions) {
-            DISPLAYLEVEL(6, "FIO_compressFilename_dstFile: transferring permissions into dst: %s \n", dstFileName);
-            UTIL_setFileStat(dstFileName, &statbuf);
-        } else {
-            DISPLAYLEVEL(6, "FIO_compressFilename_dstFile: do not transfer permissions into dst: %s \n", dstFileName);
         }
     }
 
@@ -1705,7 +1742,7 @@ FIO_compressFilename_srcFile(FIO_ctx_t* const fCtx,
         return 0;
     }
 
-    ress.srcFile = FIO_openSrcFile(srcFileName);
+    ress.srcFile = FIO_openSrcFile(prefs, srcFileName);
     if (ress.srcFile == NULL) return 1;   /* srcFile could not be opened */
 
     result = FIO_compressFilename_dstFile(fCtx, prefs, ress, dstFileName, srcFileName, compressionLevel);
@@ -1818,7 +1855,7 @@ int FIO_compressMultipleFilenames(FIO_ctx_t* const fCtx,
             FIO_freeCResources(&ress);
             return 1;
         }
-        ress.dstFile = FIO_openDstFile(fCtx, prefs, NULL, outFileName);
+        ress.dstFile = FIO_openDstFile(fCtx, prefs, NULL, outFileName, DEFAULT_FILE_PERMISSIONS);
         if (ress.dstFile == NULL) {  /* could not open outFileName */
             error = 1;
         } else {
@@ -1862,10 +1899,15 @@ int FIO_compressMultipleFilenames(FIO_ctx_t* const fCtx,
     }
 
     if (fCtx->nbFilesProcessed >= 1 && fCtx->nbFilesTotal > 1 && fCtx->totalBytesInput != 0) {
+        UTIL_HumanReadableSize_t hr_isize = UTIL_makeHumanReadableSize((U64) fCtx->totalBytesInput);
+        UTIL_HumanReadableSize_t hr_osize = UTIL_makeHumanReadableSize((U64) fCtx->totalBytesOutput);
+
         DISPLAYLEVEL(2, "\r%79s\r", "");
-        DISPLAYLEVEL(2, "%d files compressed : %.2f%%  (%6zu => %6zu bytes)\n", fCtx->nbFilesProcessed,
+        DISPLAYLEVEL(2, "%3d files compressed :%.2f%%   (%6.*f%4s => %6.*f%4s)\n",
+                        fCtx->nbFilesProcessed,
                         (double)fCtx->totalBytesOutput/((double)fCtx->totalBytesInput)*100,
-                        fCtx->totalBytesInput, fCtx->totalBytesOutput);
+                        hr_isize.precision, hr_isize.value, hr_isize.suffix,
+                        hr_osize.precision, hr_osize.value, hr_osize.suffix);
     }
 
     FIO_freeCResources(&ress);
@@ -2112,7 +2154,7 @@ FIO_decompressZstdFrame(FIO_ctx_t* const fCtx, dRess_t* ress, FILE* finput,
         if (srcFileLength>20) srcFileName += srcFileLength-20;
     }
 
-    ZSTD_resetDStream(ress->dctx);
+    ZSTD_DCtx_reset(ress->dctx, ZSTD_reset_session_only);
 
     /* Header loading : ensures ZSTD_getFrameHeader() will succeed */
     {   size_t const toDecode = ZSTD_FRAMEHEADERSIZE_MAX;
@@ -2127,6 +2169,8 @@ FIO_decompressZstdFrame(FIO_ctx_t* const fCtx, dRess_t* ress, FILE* finput,
         ZSTD_inBuffer  inBuff = { ress->srcBuffer, ress->srcBufferLoaded, 0 };
         ZSTD_outBuffer outBuff= { ress->dstBuffer, ress->dstBufferSize, 0 };
         size_t const readSizeHint = ZSTD_decompressStream(ress->dctx, &outBuff, &inBuff);
+        const int displayLevel = (!fCtx->hasStdoutOutput || g_display_prefs.progressSetting == FIO_ps_always) ? 1 : 2;
+        UTIL_HumanReadableSize_t const hrs = UTIL_makeHumanReadableSize(alreadyDecoded+frameSize);
         if (ZSTD_isError(readSizeHint)) {
             DISPLAYLEVEL(1, "%s : Decoding error (36) : %s \n",
                             srcFileName, ZSTD_getErrorName(readSizeHint));
@@ -2137,21 +2181,19 @@ FIO_decompressZstdFrame(FIO_ctx_t* const fCtx, dRess_t* ress, FILE* finput,
         /* Write block */
         storedSkips = FIO_fwriteSparse(ress->dstFile, ress->dstBuffer, outBuff.pos, prefs, storedSkips);
         frameSize += outBuff.pos;
-        if (!fCtx->hasStdoutOutput) {
-            if (fCtx->nbFilesTotal > 1) {
-                size_t srcFileNameSize = strlen(srcFileName);
-                if (srcFileNameSize > 18) {
-                    const char* truncatedSrcFileName = srcFileName + srcFileNameSize - 15;
-                    DISPLAYUPDATE(2, "\rDecompress: %2u/%2u files. Current: ...%s : %u MB...    ",
-                                    fCtx->currFileIdx+1, fCtx->nbFilesTotal, truncatedSrcFileName, (unsigned)((alreadyDecoded+frameSize)>>20) );
-                } else {
-                    DISPLAYUPDATE(2, "\rDecompress: %2u/%2u files. Current: %s : %u MB...    ",
-                                fCtx->currFileIdx+1, fCtx->nbFilesTotal, srcFileName, (unsigned)((alreadyDecoded+frameSize)>>20) );
-                }
+        if (fCtx->nbFilesTotal > 1) {
+            size_t srcFileNameSize = strlen(srcFileName);
+            if (srcFileNameSize > 18) {
+                const char* truncatedSrcFileName = srcFileName + srcFileNameSize - 15;
+                DISPLAYUPDATE(displayLevel, "\rDecompress: %2u/%2u files. Current: ...%s : %.*f%s...    ",
+                                fCtx->currFileIdx+1, fCtx->nbFilesTotal, truncatedSrcFileName, hrs.precision, hrs.value, hrs.suffix);
             } else {
-                DISPLAYUPDATE(2, "\r%-20.20s : %u MB...     ",
-                                srcFileName, (unsigned)((alreadyDecoded+frameSize)>>20) );
+                DISPLAYUPDATE(displayLevel, "\rDecompress: %2u/%2u files. Current: %s : %.*f%s...    ",
+                            fCtx->currFileIdx+1, fCtx->nbFilesTotal, srcFileName, hrs.precision, hrs.value, hrs.suffix);
             }
+        } else {
+            DISPLAYUPDATE(displayLevel, "\r%-20.20s : %.*f%s...     ",
+                            srcFileName, hrs.precision, hrs.value, hrs.suffix);
         }
 
         if (inBuff.pos > 0) {
@@ -2375,9 +2417,11 @@ FIO_decompressLz4Frame(dRess_t* ress, FILE* srcFile,
 
             /* Write Block */
             if (decodedBytes) {
+                UTIL_HumanReadableSize_t hrs;
                 storedSkips = FIO_fwriteSparse(ress->dstFile, ress->dstBuffer, decodedBytes, prefs, storedSkips);
                 filesize += decodedBytes;
-                DISPLAYUPDATE(2, "\rDecompressed : %u MB  ", (unsigned)(filesize>>20));
+                hrs = UTIL_makeHumanReadableSize(filesize);
+                DISPLAYUPDATE(2, "\rDecompressed : %.*f%s  ", hrs.precision, hrs.value, hrs.suffix);
             }
 
             if (!nextToLoad) break;
@@ -2485,10 +2529,10 @@ static int FIO_decompressFrames(FIO_ctx_t* const fCtx,
     fCtx->totalBytesOutput += (size_t)filesize;
     DISPLAYLEVEL(2, "\r%79s\r", "");
     /* No status message in pipe mode (stdin - stdout) or multi-files mode */
-    if (g_display_prefs.displayLevel >= 2) {
-        if (fCtx->nbFilesTotal <= 1 || g_display_prefs.displayLevel >= 3) {
-            DISPLAYLEVEL(2, "%-20s: %llu bytes \n", srcFileName, filesize);
-        }
+    if ((g_display_prefs.displayLevel >= 2 && fCtx->nbFilesTotal <= 1) ||
+        g_display_prefs.displayLevel >= 3 ||
+        g_display_prefs.progressSetting == FIO_ps_always) {
+        DISPLAYLEVEL(1, "\r%-20s: %llu bytes \n", srcFileName, filesize);
     }
 
     return 0;
@@ -2508,13 +2552,19 @@ static int FIO_decompressDstFile(FIO_ctx_t* const fCtx,
 {
     int result;
     stat_t statbuf;
-    int transfer_permissions = 0;
     int releaseDstFile = 0;
 
     if ((ress.dstFile == NULL) && (prefs->testMode==0)) {
+        int dstFilePermissions = DEFAULT_FILE_PERMISSIONS;
+        if ( strcmp(srcFileName, stdinmark)   /* special case : don't transfer permissions from stdin */
+          && UTIL_stat(srcFileName, &statbuf)
+          && UTIL_isRegularFileStat(&statbuf) ) {
+            dstFilePermissions = statbuf.st_mode;
+        }
+
         releaseDstFile = 1;
 
-        ress.dstFile = FIO_openDstFile(fCtx, prefs, srcFileName, dstFileName);
+        ress.dstFile = FIO_openDstFile(fCtx, prefs, srcFileName, dstFileName, dstFilePermissions);
         if (ress.dstFile==NULL) return 1;
 
         /* Must only be added after FIO_openDstFile() succeeds.
@@ -2522,11 +2572,6 @@ static int FIO_decompressDstFile(FIO_ctx_t* const fCtx,
          * and the user presses Ctrl-C when asked if they wish to overwrite.
          */
         addHandler(dstFileName);
-
-        if ( strcmp(srcFileName, stdinmark)   /* special case : don't transfer permissions from stdin */
-          && UTIL_stat(srcFileName, &statbuf)
-          && UTIL_isRegularFileStat(&statbuf) )
-            transfer_permissions = 1;
     }
 
     result = FIO_decompressFrames(fCtx, ress, srcFile, prefs, dstFileName, srcFileName);
@@ -2544,8 +2589,6 @@ static int FIO_decompressDstFile(FIO_ctx_t* const fCtx,
           && strcmp(dstFileName, stdoutmark)  /* special case : don't remove() stdout */
           ) {
             FIO_removeFile(dstFileName);  /* remove decompression artefact; note: don't do anything special if remove() fails */
-        } else if ( transfer_permissions /* file permissions correctly extracted from src */ ) {
-            UTIL_setFileStat(dstFileName, &statbuf);  /* transfer file permissions from src into dst */
         }
     }
 
@@ -2568,7 +2611,7 @@ static int FIO_decompressSrcFile(FIO_ctx_t* const fCtx, FIO_prefs_t* const prefs
         return 1;
     }
 
-    srcFile = FIO_openSrcFile(srcFileName);
+    srcFile = FIO_openSrcFile(prefs, srcFileName);
     if (srcFile==NULL) return 1;
     ress.srcBufferLoaded = 0;
 
@@ -2747,7 +2790,7 @@ FIO_decompressMultipleFilenames(FIO_ctx_t* const fCtx,
             return 1;
         }
         if (!prefs->testMode) {
-            ress.dstFile = FIO_openDstFile(fCtx, prefs, NULL, outFileName);
+            ress.dstFile = FIO_openDstFile(fCtx, prefs, NULL, outFileName, DEFAULT_FILE_PERMISSIONS);
             if (ress.dstFile == 0) EXM_THROW(19, "cannot open %s", outFileName);
         }
         for (; fCtx->currFileIdx < fCtx->nbFilesTotal; fCtx->currFileIdx++) {
@@ -2918,7 +2961,7 @@ static InfoError
 getFileInfo_fileConfirmed(fileInfo_t* info, const char* inFileName)
 {
     InfoError status;
-    FILE* const srcFile = FIO_openSrcFile(inFileName);
+    FILE* const srcFile = FIO_openSrcFile(NULL, inFileName);
     ERROR_IF(srcFile == NULL, info_file_error, "Error: could not open source file %s", inFileName);
 
     info->compressedSize = UTIL_getFileSize(inFileName);
@@ -2946,25 +2989,24 @@ getFileInfo(fileInfo_t* info, const char* srcFileName)
 static void
 displayInfo(const char* inFileName, const fileInfo_t* info, int displayLevel)
 {
-    unsigned const unit = info->compressedSize < (1 MB) ? (1 KB) : (1 MB);
-    const char* const unitStr = info->compressedSize < (1 MB) ? "KB" : "MB";
-    double const windowSizeUnit = (double)info->windowSize / unit;
-    double const compressedSizeUnit = (double)info->compressedSize / unit;
-    double const decompressedSizeUnit = (double)info->decompressedSize / unit;
+    UTIL_HumanReadableSize_t const window_hrs = UTIL_makeHumanReadableSize(info->windowSize);
+    UTIL_HumanReadableSize_t const compressed_hrs = UTIL_makeHumanReadableSize(info->compressedSize);
+    UTIL_HumanReadableSize_t const decompressed_hrs = UTIL_makeHumanReadableSize(info->decompressedSize);
     double const ratio = (info->compressedSize == 0) ? 0 : ((double)info->decompressedSize)/(double)info->compressedSize;
     const char* const checkString = (info->usesCheck ? "XXH64" : "None");
     if (displayLevel <= 2) {
         if (!info->decompUnavailable) {
-            DISPLAYOUT("%6d  %5d  %7.2f %2s  %9.2f %2s  %5.3f  %5s  %s\n",
+            DISPLAYOUT("%6d  %5d  %6.*f%4s  %8.*f%4s  %5.3f  %5s  %s\n",
                     info->numSkippableFrames + info->numActualFrames,
                     info->numSkippableFrames,
-                    compressedSizeUnit, unitStr, decompressedSizeUnit, unitStr,
+                    compressed_hrs.precision, compressed_hrs.value, compressed_hrs.suffix,
+                    decompressed_hrs.precision, decompressed_hrs.value, decompressed_hrs.suffix,
                     ratio, checkString, inFileName);
         } else {
-            DISPLAYOUT("%6d  %5d  %7.2f %2s                       %5s  %s\n",
+            DISPLAYOUT("%6d  %5d  %6.*f%4s                       %5s  %s\n",
                     info->numSkippableFrames + info->numActualFrames,
                     info->numSkippableFrames,
-                    compressedSizeUnit, unitStr,
+                    compressed_hrs.precision, compressed_hrs.value, compressed_hrs.suffix,
                     checkString, inFileName);
         }
     } else {
@@ -2972,15 +3014,15 @@ displayInfo(const char* inFileName, const fileInfo_t* info, int displayLevel)
         DISPLAYOUT("# Zstandard Frames: %d\n", info->numActualFrames);
         if (info->numSkippableFrames)
             DISPLAYOUT("# Skippable Frames: %d\n", info->numSkippableFrames);
-        DISPLAYOUT("Window Size: %.2f %2s (%llu B)\n",
-                   windowSizeUnit, unitStr,
+        DISPLAYOUT("Window Size: %.*f%s (%llu B)\n",
+                   window_hrs.precision, window_hrs.value, window_hrs.suffix,
                    (unsigned long long)info->windowSize);
-        DISPLAYOUT("Compressed Size: %.2f %2s (%llu B)\n",
-                    compressedSizeUnit, unitStr,
+        DISPLAYOUT("Compressed Size: %.*f%s (%llu B)\n",
+                    compressed_hrs.precision, compressed_hrs.value, compressed_hrs.suffix,
                     (unsigned long long)info->compressedSize);
         if (!info->decompUnavailable) {
-            DISPLAYOUT("Decompressed Size: %.2f %2s (%llu B)\n",
-                    decompressedSizeUnit, unitStr,
+            DISPLAYOUT("Decompressed Size: %.*f%s (%llu B)\n",
+                    decompressed_hrs.precision, decompressed_hrs.value, decompressed_hrs.suffix,
                     (unsigned long long)info->decompressedSize);
             DISPLAYOUT("Ratio: %.4f\n", ratio);
         }
@@ -3068,24 +3110,23 @@ int FIO_listMultipleFiles(unsigned numFiles, const char** filenameTable, int dis
                 error |= FIO_listFile(&total, filenameTable[u], displayLevel);
         }   }
         if (numFiles > 1 && displayLevel <= 2) {   /* display total */
-            unsigned const unit = total.compressedSize < (1 MB) ? (1 KB) : (1 MB);
-            const char* const unitStr = total.compressedSize < (1 MB) ? "KB" : "MB";
-            double const compressedSizeUnit = (double)total.compressedSize / unit;
-            double const decompressedSizeUnit = (double)total.decompressedSize / unit;
+            UTIL_HumanReadableSize_t const compressed_hrs = UTIL_makeHumanReadableSize(total.compressedSize);
+            UTIL_HumanReadableSize_t const decompressed_hrs = UTIL_makeHumanReadableSize(total.decompressedSize);
             double const ratio = (total.compressedSize == 0) ? 0 : ((double)total.decompressedSize)/(double)total.compressedSize;
             const char* const checkString = (total.usesCheck ? "XXH64" : "");
             DISPLAYOUT("----------------------------------------------------------------- \n");
             if (total.decompUnavailable) {
-                DISPLAYOUT("%6d  %5d  %7.2f %2s                       %5s  %u files\n",
+                DISPLAYOUT("%6d  %5d  %6.*f%4s                       %5s  %u files\n",
                         total.numSkippableFrames + total.numActualFrames,
                         total.numSkippableFrames,
-                        compressedSizeUnit, unitStr,
+                        compressed_hrs.precision, compressed_hrs.value, compressed_hrs.suffix,
                         checkString, (unsigned)total.nbFiles);
             } else {
-                DISPLAYOUT("%6d  %5d  %7.2f %2s  %9.2f %2s  %5.3f  %5s  %u files\n",
+                DISPLAYOUT("%6d  %5d  %6.*f%4s  %8.*f%4s  %5.3f  %5s  %u files\n",
                         total.numSkippableFrames + total.numActualFrames,
                         total.numSkippableFrames,
-                        compressedSizeUnit, unitStr, decompressedSizeUnit, unitStr,
+                        compressed_hrs.precision, compressed_hrs.value, compressed_hrs.suffix,
+                        decompressed_hrs.precision, decompressed_hrs.value, decompressed_hrs.suffix,
                         ratio, checkString, (unsigned)total.nbFiles);
         }   }
         return error;

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Przemyslaw Skibinski, Yann Collet, Facebook, Inc.
+ * Copyright (c) Przemyslaw Skibinski, Yann Collet, Facebook, Inc.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -122,6 +122,7 @@ int UTIL_requireUserConfirmation(const char* prompt, const char* abortMsg, const
 #define STRDUP(s) strdup(s)
 #endif
 
+
 /**
  * Calls platform's equivalent of stat() on filename and writes info to statbuf.
  * Returns success (1) or failure (0).
@@ -143,6 +144,7 @@ int UTIL_setFileStat(const char* filename, const stat_t* statbuf);
 int UTIL_isRegularFileStat(const stat_t* statbuf);
 int UTIL_isDirectoryStat(const stat_t* statbuf);
 int UTIL_isFIFOStat(const stat_t* statbuf);
+int UTIL_isBlockDevStat(const stat_t* statbuf);
 U64 UTIL_getFileSizeStat(const stat_t* statbuf);
 
 /**
@@ -168,6 +170,19 @@ int UTIL_isFIFO(const char* infilename);
 #define UTIL_FILESIZE_UNKNOWN  ((U64)(-1))
 U64 UTIL_getFileSize(const char* infilename);
 U64 UTIL_getTotalFileSize(const char* const * fileNamesTable, unsigned nbFiles);
+
+/**
+ * Take a size in bytes and prepare the components to pretty-print it in a
+ * scaled way. The components in the returned struct should be passed in
+ * precision, value, suffix order to a "%.*f%s" format string.
+ */
+typedef struct {
+  double value;
+  int precision;
+  const char* suffix;
+} UTIL_HumanReadableSize_t;
+
+UTIL_HumanReadableSize_t UTIL_makeHumanReadableSize(U64 size);
 
 int UTIL_compareStr(const void *p1, const void *p2);
 const char* UTIL_getFileExtension(const char* infilename);
@@ -272,15 +287,21 @@ void UTIL_refFilename(FileNamesTable* fnt, const char* filename);
  *        or NULL in case of error
  */
 FileNamesTable*
-UTIL_createExpandedFNT(const char** filenames, size_t nbFilenames, int followLinks);
+UTIL_createExpandedFNT(const char* const* filenames, size_t nbFilenames, int followLinks);
 
+#if defined(_WIN32) || defined(WIN32)
+DWORD CountSetBits(ULONG_PTR bitMask);
+#endif
 
 /*-****************************************
  *  System
  ******************************************/
 
+int UTIL_countCores(int logical);
+
 int UTIL_countPhysicalCores(void);
 
+int UTIL_countLogicalCores(void);
 
 #if defined (__cplusplus)
 }

@@ -1,5 +1,5 @@
 # ################################################################
-# Copyright (c) 2015-2021, Yann Collet, Facebook, Inc.
+# Copyright (c) Yann Collet, Facebook, Inc.
 # All rights reserved.
 #
 # This source code is licensed under both the BSD-style license (found in the
@@ -100,17 +100,22 @@ ZSTD_ALL_SRC = $(ZSTDLIB_LOCAL_SRC) $(ZSTD_CLI_SRC)
 ZSTD_ALL_OBJ := $(ZSTD_ALL_SRC:.c=.o)
 
 UNAME := $(shell uname)
+
+ifndef BUILD_DIR
 ifeq ($(UNAME), Darwin)
-  HASH ?= md5
+  ifeq ($(shell md5 < /dev/null > /dev/null; echo $$?), 0)
+    HASH ?= md5
+  endif
 else ifeq ($(UNAME), FreeBSD)
   HASH ?= gmd5sum
+else ifeq ($(UNAME), NetBSD)
+  HASH ?= md5 -n
 else ifeq ($(UNAME), OpenBSD)
   HASH ?= md5
 endif
 HASH ?= md5sum
 HAVE_HASH :=$(shell echo 1 | $(HASH) > /dev/null && echo 1 || echo 0)
 
-ifndef BUILD_DIR
 HASH_DIR = conf_$(shell echo $(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LDLIBS) $(ZSTD_FILES) | $(HASH) | cut -f 1 -d " ")
 ifeq ($(HAVE_HASH),0)
   $(info warning : could not find HASH ($(HASH)), needed to differentiate builds using different flags)
@@ -194,7 +199,7 @@ endif
 endif
 
 SET_CACHE_DIRECTORY = \
-	$(MAKE) --no-print-directory $@ \
+   +$(MAKE) --no-print-directory $@ \
     BUILD_DIR=obj/$(HASH_DIR) \
     CPPFLAGS="$(CPPFLAGS)" \
     CFLAGS="$(CFLAGS)" \
@@ -274,16 +279,19 @@ zstd-nolegacy : LDFLAGS += $(THREAD_LD) $(ZLIBLD) $(LZMALD) $(LZ4LD) $(DEBUGFLAG
 zstd-nolegacy : $(ZSTDLIB_CORE_SRC) $(ZDICT_SRC) $(ZSTD_CLI_OBJ)
 	$(CC) $(FLAGS) $^ -o $@$(EXT) $(LDFLAGS)
 
+.PHONY: zstd-nomt
 zstd-nomt : THREAD_CPP :=
 zstd-nomt : THREAD_LD  :=
 zstd-nomt : THREAD_MSG := - multi-threading disabled
 zstd-nomt : zstd
 
+.PHONY: zstd-nogz
 zstd-nogz : ZLIBCPP :=
 zstd-nogz : ZLIBLD  :=
 zstd-nogz : ZLIB_MSG := - gzip support is disabled
 zstd-nogz : zstd
 
+.PHONY: zstd-noxz
 zstd-noxz : LZMACPP :=
 zstd-noxz : LZMALD  :=
 zstd-noxz : LZMA_MSG := - xz/lzma support is disabled
@@ -298,6 +306,7 @@ zstd-dll : zstd
 
 
 ## zstd-pgo: zstd executable optimized with PGO.
+.PHONY: zstd-pgo
 zstd-pgo :
 	$(MAKE) clean
 	$(MAKE) zstd MOREFLAGS=-fprofile-generate
@@ -314,16 +323,16 @@ zstd-pgo :
 ## zstd-small: minimal target, supporting only zstd compression and decompression. no bench. no legacy. no other format.
 zstd-small: CFLAGS = -Os -s
 zstd-frugal zstd-small: $(ZSTDLIB_CORE_SRC) zstdcli.c util.c timefn.c fileio.c
-	$(CC) $(FLAGS) -DZSTD_NOBENCH -DZSTD_NODICT $^ -o $@$(EXT)
+	$(CC) $(FLAGS) -DZSTD_NOBENCH -DZSTD_NODICT -DZSTD_NOTRACE $^ -o $@$(EXT)
 
 zstd-decompress: $(ZSTDLIB_COMMON_C) $(ZSTDLIB_DECOMPRESS_C) zstdcli.c util.c timefn.c fileio.c
-	$(CC) $(FLAGS) -DZSTD_NOBENCH -DZSTD_NODICT -DZSTD_NOCOMPRESS $^ -o $@$(EXT)
+	$(CC) $(FLAGS) -DZSTD_NOBENCH -DZSTD_NODICT -DZSTD_NOCOMPRESS -DZSTD_NOTRACE $^ -o $@$(EXT)
 
 zstd-compress: $(ZSTDLIB_COMMON_C) $(ZSTDLIB_COMPRESS_C) zstdcli.c util.c timefn.c fileio.c
-	$(CC) $(FLAGS) -DZSTD_NOBENCH -DZSTD_NODICT -DZSTD_NODECOMPRESS $^ -o $@$(EXT)
+	$(CC) $(FLAGS) -DZSTD_NOBENCH -DZSTD_NODICT -DZSTD_NODECOMPRESS -DZSTD_NOTRACE $^ -o $@$(EXT)
 
 ## zstd-dictBuilder: executable supporting dictionary creation and compression (only)
-zstd-dictBuilder: CPPFLAGS += -DZSTD_NOBENCH -DZSTD_NODECOMPRESS
+zstd-dictBuilder: CPPFLAGS += -DZSTD_NOBENCH -DZSTD_NODECOMPRESS -DZSTD_NOTRACE
 zstd-dictBuilder: $(ZSTDLIB_COMMON_C) $(ZSTDLIB_COMPRESS_C) $(ZDICT_SRC) zstdcli.c util.c timefn.c fileio.c dibio.c
 	$(CC) $(FLAGS) $^ -o $@$(EXT)
 

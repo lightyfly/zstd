@@ -1,5 +1,5 @@
 # ################################################################
-# Copyright (c) 2015-2021, Facebook, Inc.
+# Copyright (c) Facebook, Inc.
 # All rights reserved.
 #
 # This source code is licensed under both the BSD-style license (found in the
@@ -15,7 +15,7 @@ CURL_LDFLAGS := $(shell curl-config --libs) -pthread
 
 PROGDIR := ../../programs
 LIBDIR := ../../lib
-ZSTD_CPPFLAGS := -I$(PROGDIR) -I$(LIBDIR) -I$(LIBDIR)/common
+ZSTD_CPPFLAGS := -I$(PROGDIR) -I$(LIBDIR) -I$(LIBDIR)/common -Wno-deprecated-declarations
 
 REGRESSION_CFLAGS = $(CFLAGS) $(CURL_CFLAGS)
 REGRESSION_CPPFLAGS = $(CPPFLAGS) $(ZSTD_CPPFLAGS)
