@@ -1,5 +1,5 @@
 # ################################################################
-# Copyright (c) 2021-2021, Facebook, Inc.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under both the BSD-style license (found in the
@@ -87,7 +87,7 @@ def clone_and_build(build):
             git clone {github_url} zstd-{user}-{sha} &&
             cd zstd-{user}-{sha} &&
             {checkout_command}
-            make &&
+            make -j &&
             cd ../
         """.format(
                 user=build["user"],
@@ -100,7 +100,7 @@ def clone_and_build(build):
         )
         return "zstd-{user}-{sha}/zstd".format(user=build["user"], sha=build["hash"])
     else:
-        os.system("cd ../ && make && cd tests")
+        os.system("cd ../ && make -j && cd tests")
         return "../zstd"
 
 
@@ -112,9 +112,9 @@ def parse_benchmark_output(output):
 def benchmark_single(executable, level, filename):
     return parse_benchmark_output((
         subprocess.run(
-            [executable, "-qb{}".format(level), filename], stderr=subprocess.PIPE
+            [executable, "-qb{}".format(level), filename], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
-        .stderr.decode("utf-8")
+        .stdout.decode("utf-8")
         .split(" ")
     ))
 
@@ -145,7 +145,7 @@ def benchmark(build, filenames, levels, iterations):
 def benchmark_dictionary_single(executable, filenames_directory, dictionary_filename, level, iterations):
     cspeeds, dspeeds = [], []
     for _ in range(iterations):
-        output = subprocess.run([executable, "-qb{}".format(level), "-D", dictionary_filename, "-r", filenames_directory], stderr=subprocess.PIPE).stderr.decode("utf-8").split(" ")
+        output = subprocess.run([executable, "-qb{}".format(level), "-D", dictionary_filename, "-r", filenames_directory], stdout=subprocess.PIPE).stdout.decode("utf-8").split(" ")
         cspeed, dspeed = parse_benchmark_output(output)
         cspeeds.append(cspeed)
         dspeeds.append(dspeed)
@@ -225,7 +225,7 @@ def get_regressions_dictionary(baseline_build, test_build, filenames_directory, 
     for j, level in enumerate(levels):
         old_cspeed, old_dspeed = old[j]
         new_cspeed, new_dspeed = new[j]
-        cspeed_reg, dspeed_reg, baesline_label, test_label = parse_regressions_and_labels(
+        cspeed_reg, dspeed_reg, baseline_label, test_label = parse_regressions_and_labels(
             old_cspeed, new_cspeed, old_dspeed, new_dspeed, baseline_build, test_build
         )
         if cspeed_reg > CSPEED_REGRESSION_TOLERANCE:
@@ -291,12 +291,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--directory", help="directory with files to benchmark", default="golden-compression")
-    parser.add_argument("--levels", help="levels to test eg ('1,2,3')", default="1")
+    parser.add_argument("--levels", help="levels to test e.g. ('1,2,3')", default="1")
     parser.add_argument("--iterations", help="number of benchmark iterations to run", default="1")
     parser.add_argument("--emails", help="email addresses of people who will be alerted upon regression. Only for continuous mode", default=None)
     parser.add_argument("--frequency", help="specifies the number of seconds to wait before each successive check for new PRs in continuous mode", default=DEFAULT_MAX_API_CALL_FREQUENCY_SEC)
     parser.add_argument("--mode", help="'fastmode', 'onetime', 'current', or 'continuous' (see README.md for details)", default="current")
-    parser.add_argument("--dict", help="filename of dictionary to use (when set, this dictioanry will be used to compress the files provided inside --directory)", default=None)
+    parser.add_argument("--dict", help="filename of dictionary to use (when set, this dictionary will be used to compress the files provided inside --directory)", default=None)
 
     args = parser.parse_args()
     filenames = args.directory
@@ -315,7 +315,7 @@ if __name__ == "__main__":
         quit()
 
     if mode == "onetime":
-        main(filenames, levels, iterations, frequency=frequenc, dictionary_filename=dictionary_filename)
+        main(filenames, levels, iterations, frequency=frequency, dictionary_filename=dictionary_filename)
     elif mode == "current":
         builds = [{"user": None, "branch": "None", "hash": None}]
         main(filenames, levels, iterations, builds, frequency=frequency, dictionary_filename=dictionary_filename)

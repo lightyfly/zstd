@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 # ################################################################
-# Copyright (c) 2016-2021, Facebook, Inc.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under both the BSD-style license (found in the
@@ -11,6 +11,7 @@
 # ##########################################################################
 
 import argparse
+import concurrent.futures
 import contextlib
 import os
 import re
@@ -62,6 +63,11 @@ TARGET_INFO = {
     'decompress_dstSize_tooSmall': TargetInfo(InputType.RAW_DATA),
     'fse_read_ncount': TargetInfo(InputType.RAW_DATA),
     'sequence_compression_api': TargetInfo(InputType.RAW_DATA),
+    'seekable_roundtrip': TargetInfo(InputType.RAW_DATA),
+    'huf_round_trip': TargetInfo(InputType.RAW_DATA),
+    'huf_decompress': TargetInfo(InputType.RAW_DATA),
+    'decompress_cross_format': TargetInfo(InputType.RAW_DATA),
+    'generate_sequences': TargetInfo(InputType.RAW_DATA),
 }
 TARGETS = list(TARGET_INFO.keys())
 ALL_TARGETS = TARGETS + ['all']
@@ -75,6 +81,7 @@ CFLAGS = os.environ.get('CFLAGS', '-O3')
 CXXFLAGS = os.environ.get('CXXFLAGS', CFLAGS)
 LDFLAGS = os.environ.get('LDFLAGS', '')
 MFLAGS = os.environ.get('MFLAGS', '-j')
+THIRD_PARTY_SEQ_PROD_OBJ = os.environ.get('THIRD_PARTY_SEQ_PROD_OBJ', '')
 
 # Fuzzing environment variables
 LIB_FUZZING_ENGINE = os.environ.get('LIB_FUZZING_ENGINE', 'libregression.a')
@@ -180,14 +187,15 @@ def compiler_version(cc, cxx):
     cxx_version_bytes = subprocess.check_output([cxx, "--version"])
     compiler = None
     version = None
+    print("{} --version:\n{}".format(cc, cc_version_bytes.decode('ascii')))
     if b'clang' in cc_version_bytes:
         assert(b'clang' in cxx_version_bytes)
         compiler = 'clang'
-    elif b'gcc' in cc_version_bytes:
+    elif b'gcc' in cc_version_bytes or b'GCC' in cc_version_bytes:
         assert(b'gcc' in cxx_version_bytes or b'g++' in cxx_version_bytes)
         compiler = 'gcc'
     if compiler is not None:
-        version_regex = b'([0-9])+\.([0-9])+\.([0-9])+'
+        version_regex = b'([0-9]+)\.([0-9]+)\.([0-9]+)'
         version_match = re.search(version_regex, cc_version_bytes)
         version = tuple(int(version_match.group(i)) for i in range(1, 4))
     return compiler, version
@@ -195,9 +203,9 @@ def compiler_version(cc, cxx):
 
 def overflow_ubsan_flags(cc, cxx):
     compiler, version = compiler_version(cc, cxx)
-    if compiler == 'gcc':
+    if compiler == 'gcc' and version < (8, 0, 0):
         return ['-fno-sanitize=signed-integer-overflow']
-    if compiler == 'clang' and version >= (5, 0, 0):
+    if compiler == 'gcc' or (compiler == 'clang' and version >= (5, 0, 0)):
         return ['-fno-sanitize=pointer-overflow']
     return []
 
@@ -245,10 +253,10 @@ def build_parser(args):
         action='store_true',
         help='Enable UBSAN')
     parser.add_argument(
-        '--enable-ubsan-pointer-overflow',
+        '--disable-ubsan-pointer-overflow',
         dest='ubsan_pointer_overflow',
-        action='store_true',
-        help='Enable UBSAN pointer overflow check (known failure)')
+        action='store_false',
+        help='Disable UBSAN pointer overflow check (known failure)')
     parser.add_argument(
         '--enable-msan', dest='msan', action='store_true', help='Enable MSAN')
     parser.add_argument(
@@ -316,6 +324,12 @@ def build_parser(args):
         action='store_true',
         help='Reuse contexts between runs (makes reproduction impossible)')
     parser.add_argument(
+        '--custom-seq-prod',
+        dest='third_party_seq_prod_obj',
+        type=str,
+        default=THIRD_PARTY_SEQ_PROD_OBJ,
+        help='Path to an object file with symbols for fuzzing your sequence producer plugin.')
+    parser.add_argument(
         '--cc',
         dest='cc',
         type=str,
@@ -372,8 +386,6 @@ def build_parser(args):
         raise RuntimeError('MSAN may not be used with any other sanitizers')
     if args.msan_track_origins and not args.msan:
         raise RuntimeError('--enable-msan-track-origins requires MSAN')
-    if args.ubsan_pointer_overflow and not args.ubsan:
-        raise RuntimeError('--enable-ubsan-pointer-overflow requires UBSAN')
     if args.sanitize_recover and not args.sanitize:
         raise RuntimeError('--enable-sanitize-recover but no sanitizers used')
 
@@ -396,7 +408,11 @@ def build(args):
     cxxflags = shlex.split(args.cxxflags)
     mflags = shlex.split(args.mflags)
     # Flags to be added to both cflags and cxxflags
-    common_flags = []
+    common_flags = [
+        '-Wno-error=declaration-after-statement',
+        '-Wno-error=c++-compat',
+        '-Wno-error=deprecated' # C files are sometimes compiled with CXX
+    ]
 
     cppflags += [
         '-DDEBUGLEVEL={}'.format(args.debug),
@@ -446,6 +462,10 @@ def build(args):
     if args.stateful_fuzzing:
         cppflags += ['-DSTATEFUL_FUZZING']
 
+    if args.third_party_seq_prod_obj:
+        cppflags += ['-DFUZZ_THIRD_PARTY_SEQ_PROD']
+        mflags += ['THIRD_PARTY_SEQ_PROD_OBJ={}'.format(args.third_party_seq_prod_obj)]
+
     if args.fuzzing_mode:
         cppflags += ['-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION']
 
@@ -479,6 +499,7 @@ def build(args):
     subprocess.check_call(clean_cmd)
     build_cmd = [
         'make',
+        '-j',
         cc_str,
         cxx_str,
         cppflags_str,
@@ -628,25 +649,48 @@ def afl(args):
     return 0
 
 
+def corpus_size(target):
+    size = 0
+    for root, _, files in os.walk(abs_join(CORPORA_DIR, target)):
+        size += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+    return size
+
+
 def regression(args):
     try:
         description = """
         Runs one or more regression tests.
-        The fuzzer should have been built with with
+        The fuzzer should have been built with
         LIB_FUZZING_ENGINE='libregression.a'.
         Takes input from CORPORA.
+        Targets run in parallel, one per CPU.
         """
         args = targets_parser(args, description)
     except Exception as e:
         print(e)
         return 1
-    for target in args.TARGET:
+
+    def run(target):
         corpora = create(abs_join(CORPORA_DIR, target))
-        target = abs_join(FUZZ_DIR, target)
-        cmd = [target, corpora]
-        print(' '.join(cmd))
-        subprocess.check_call(cmd)
-    return 0
+        cmd = [abs_join(FUZZ_DIR, target), corpora]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        return cmd, result
+
+    # Largest corpora take longest: start them first
+    targets = sorted(args.TARGET, key=corpus_size, reverse=True)
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+        runs = [pool.submit(run, target) for target in targets]
+        for done in concurrent.futures.as_completed(runs):
+            cmd, result = done.result()
+            print(' '.join(cmd))
+            print(result.stdout.decode(errors='replace'), end='', flush=True)
+            if result.returncode != 0:
+                failed.append(cmd[0])
+    for target in failed:
+        print('FAILED: {}'.format(target))
+    return 1 if failed else 0
 
 
 def gen_parser(args):

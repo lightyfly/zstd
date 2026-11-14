@@ -1,13 +1,20 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0+ OR BSD-3-Clause
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under both the BSD-style license (found in the
+ * LICENSE file in the root directory of this source tree) and the GPLv2 (found
+ * in the COPYING file in the root directory of this source tree).
+ * You may select, at your option, one of the above-listed licenses.
+ */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/zstd.h>
 
-#include "zstd.h"
 #include "common/zstd_deps.h"
-#include "common/zstd_errors.h"
 
 /* Common symbols. zstd_compress must depend on zstd_decompress. */
 
@@ -17,7 +24,7 @@ unsigned int zstd_is_error(size_t code)
 }
 EXPORT_SYMBOL(zstd_is_error);
 
-int zstd_get_error_code(size_t code)
+zstd_error_code zstd_get_error_code(size_t code)
 {
 	return ZSTD_getErrorCode(code);
 }
@@ -37,6 +44,33 @@ size_t zstd_dctx_workspace_bound(void)
 }
 EXPORT_SYMBOL(zstd_dctx_workspace_bound);
 
+zstd_dctx *zstd_create_dctx_advanced(zstd_custom_mem custom_mem)
+{
+	return ZSTD_createDCtx_advanced(custom_mem);
+}
+EXPORT_SYMBOL(zstd_create_dctx_advanced);
+
+size_t zstd_free_dctx(zstd_dctx *dctx)
+{
+	return ZSTD_freeDCtx(dctx);
+}
+EXPORT_SYMBOL(zstd_free_dctx);
+
+zstd_ddict *zstd_create_ddict_byreference(const void *dict, size_t dict_size,
+					  zstd_custom_mem custom_mem)
+{
+	return ZSTD_createDDict_advanced(dict, dict_size, ZSTD_dlm_byRef,
+					 ZSTD_dct_auto, custom_mem);
+
+}
+EXPORT_SYMBOL(zstd_create_ddict_byreference);
+
+size_t zstd_free_ddict(zstd_ddict *ddict)
+{
+	return ZSTD_freeDDict(ddict);
+}
+EXPORT_SYMBOL(zstd_free_ddict);
+
 zstd_dctx *zstd_init_dctx(void *workspace, size_t workspace_size)
 {
 	if (workspace == NULL)
@@ -51,6 +85,15 @@ size_t zstd_decompress_dctx(zstd_dctx *dctx, void *dst, size_t dst_capacity,
 	return ZSTD_decompressDCtx(dctx, dst, dst_capacity, src, src_size);
 }
 EXPORT_SYMBOL(zstd_decompress_dctx);
+
+size_t zstd_decompress_using_ddict(zstd_dctx *dctx,
+	void *dst, size_t dst_capacity, const void* src, size_t src_size,
+	const zstd_ddict* ddict)
+{
+	return ZSTD_decompress_usingDDict(dctx, dst, dst_capacity, src,
+					  src_size, ddict);
+}
+EXPORT_SYMBOL(zstd_decompress_using_ddict);
 
 size_t zstd_dstream_workspace_bound(size_t max_window_size)
 {
@@ -70,23 +113,14 @@ EXPORT_SYMBOL(zstd_init_dstream);
 
 size_t zstd_reset_dstream(zstd_dstream *dstream)
 {
-	return ZSTD_resetDStream(dstream);
+	return ZSTD_DCtx_reset(dstream, ZSTD_reset_session_only);
 }
 EXPORT_SYMBOL(zstd_reset_dstream);
 
-size_t zstd_decompress_stream(zstd_dstream *dstream,
-	struct zstd_out_buffer *output, struct zstd_in_buffer *input)
+size_t zstd_decompress_stream(zstd_dstream *dstream, zstd_out_buffer *output,
+	zstd_in_buffer *input)
 {
-	ZSTD_outBuffer o;
-	ZSTD_inBuffer i;
-	size_t ret;
-
-	ZSTD_memcpy(&o, output, sizeof(o));
-	ZSTD_memcpy(&i, input, sizeof(i));
-	ret = ZSTD_decompressStream(dstream, &o, &i);
-	ZSTD_memcpy(output, &o, sizeof(o));
-	ZSTD_memcpy(input, &i, sizeof(i));
-	return ret;
+	return ZSTD_decompressStream(dstream, output, input);
 }
 EXPORT_SYMBOL(zstd_decompress_stream);
 
@@ -96,27 +130,12 @@ size_t zstd_find_frame_compressed_size(const void *src, size_t src_size)
 }
 EXPORT_SYMBOL(zstd_find_frame_compressed_size);
 
-size_t zstd_get_frame_params(struct zstd_frame_params *params, const void *src,
+size_t zstd_get_frame_header(zstd_frame_header *header, const void *src,
 	size_t src_size)
 {
-	ZSTD_frameHeader h;
-	const size_t ret = ZSTD_getFrameHeader(&h, src, src_size);
-
-	if (ret != 0)
-		return ret;
-
-	if (h.frameContentSize != ZSTD_CONTENTSIZE_UNKNOWN)
-		params->frame_content_size = h.frameContentSize;
-	else
-		params->frame_content_size = 0;
-
-	params->window_size = h.windowSize;
-	params->dict_id = h.dictID;
-	params->checksum_flag = h.checksumFlag;
-
-	return ret;
+	return ZSTD_getFrameHeader(header, src, src_size);
 }
-EXPORT_SYMBOL(zstd_get_frame_params);
+EXPORT_SYMBOL(zstd_get_frame_header);
 
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_DESCRIPTION("Zstd Decompressor");

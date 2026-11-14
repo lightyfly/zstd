@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -20,7 +20,7 @@
  *  Dependencies
  *********************************************************/
 #include "../common/mem.h"             /* BYTE, U16, U32 */
-#include "../common/zstd_internal.h"   /* ZSTD_seqSymbol */
+#include "../common/zstd_internal.h"   /* constants : MaxLL, MaxML, MaxOff, LLFSELog, etc. */
 
 
 
@@ -40,7 +40,7 @@ static UNUSED_ATTR const U32 OF_base[MaxOff+1] = {
                  0xFFFD, 0x1FFFD, 0x3FFFD, 0x7FFFD, 0xFFFFD, 0x1FFFFD, 0x3FFFFD, 0x7FFFFD,
                  0xFFFFFD, 0x1FFFFFD, 0x3FFFFFD, 0x7FFFFFD, 0xFFFFFFD, 0x1FFFFFFD, 0x3FFFFFFD, 0x7FFFFFFD };
 
-static UNUSED_ATTR const U32 OF_bits[MaxOff+1] = {
+static UNUSED_ATTR const U8 OF_bits[MaxOff+1] = {
                      0,  1,  2,  3,  4,  5,  6,  7,
                      8,  9, 10, 11, 12, 13, 14, 15,
                     16, 17, 18, 19, 20, 21, 22, 23,
@@ -75,12 +75,13 @@ static UNUSED_ATTR const U32 ML_base[MaxML+1] = {
 
 #define ZSTD_BUILD_FSE_TABLE_WKSP_SIZE (sizeof(S16) * (MaxSeq + 1) + (1u << MaxFSELog) + sizeof(U64))
 #define ZSTD_BUILD_FSE_TABLE_WKSP_SIZE_U32 ((ZSTD_BUILD_FSE_TABLE_WKSP_SIZE + sizeof(U32) - 1) / sizeof(U32))
+#define ZSTD_HUFFDTABLE_CAPACITY_LOG 12
 
 typedef struct {
     ZSTD_seqSymbol LLTable[SEQSYMBOL_TABLE_SIZE(LLFSELog)];    /* Note : Space reserved for FSE Tables */
     ZSTD_seqSymbol OFTable[SEQSYMBOL_TABLE_SIZE(OffFSELog)];   /* is also used as temporary workspace while building hufTable during DDict creation */
     ZSTD_seqSymbol MLTable[SEQSYMBOL_TABLE_SIZE(MLFSELog)];    /* and therefore must be at least HUF_DECOMPRESS_WORKSPACE_SIZE large */
-    HUF_DTable hufTable[HUF_DTABLE_SIZE(HufLog)];  /* can accommodate HUF_decompress4X */
+    HUF_DTable hufTable[HUF_DTABLE_SIZE(ZSTD_HUFFDTABLE_CAPACITY_LOG)];  /* can accommodate HUF_decompress4X */
     U32 rep[ZSTD_REP_NUM];
     U32 workspace[ZSTD_BUILD_FSE_TABLE_WKSP_SIZE_U32];
 } ZSTD_entropyDTables_t;
@@ -106,6 +107,22 @@ typedef struct {
     size_t ddictPtrCount;
 } ZSTD_DDictHashSet;
 
+#ifndef ZSTD_DECODER_INTERNAL_BUFFER
+#  define ZSTD_DECODER_INTERNAL_BUFFER  (1 << 16)
+#endif
+
+#define ZSTD_LBMIN 64
+#define ZSTD_LBMAX (128 << 10)
+
+/* extra buffer, compensates when dst is not large enough to store litBuffer */
+#define ZSTD_LITBUFFEREXTRASIZE  BOUNDED(ZSTD_LBMIN, ZSTD_DECODER_INTERNAL_BUFFER, ZSTD_LBMAX)
+
+typedef enum {
+    ZSTD_not_in_dst = 0,  /* Stored entirely within litExtraBuffer */
+    ZSTD_in_dst = 1,           /* Stored entirely within dst (in memory after current output write) */
+    ZSTD_split = 2            /* Split between litExtraBuffer and dst */
+} ZSTD_litLocation_e;
+
 struct ZSTD_DCtx_s
 {
     const ZSTD_seqSymbol* LLTptr;
@@ -119,7 +136,8 @@ struct ZSTD_DCtx_s
     const void* virtualStart;     /* virtual start of previous segment if it was just before current one */
     const void* dictEnd;          /* end of previous segment */
     size_t expected;
-    ZSTD_frameHeader fParams;
+    ZSTD_FrameHeader fParams;
+    U64 processedCSize;
     U64 decodedSize;
     blockType_e bType;            /* used in ZSTD_decompressContinue(), store blockType between block header decoding and block decompression stages */
     ZSTD_dStage stage;
@@ -135,16 +153,24 @@ struct ZSTD_DCtx_s
     size_t litSize;
     size_t rleSize;
     size_t staticSize;
-    int bmi2;                     /* == 1 if the CPU supports BMI2 and 0 otherwise. CPU support is determined dynamically once per context lifetime. */
+    int isFrameDecompression;
+#if DYNAMIC_BMI2
+    int bmi2;                     /* == 1 if the CPU supports BMI2 and 0 otherwise when CPU state
+                                   * is cached per context. Never read this directly: use ZSTD_DCtx_get_bmi2(),
+                                   * which also handles builds
+                                   * where cached CPU state is not used. */
+#endif
 
     /* dictionary */
     ZSTD_DDict* ddictLocal;
-    const ZSTD_DDict* ddict;     /* set by ZSTD_initDStream_usingDDict(), or ZSTD_DCtx_refDDict() */
+    const ZSTD_DDict* ddict;     /* single-DDict state; NULL while ddictSet exists */
     U32 dictID;
     int ddictIsCold;             /* if == 1 : dictionary is "new" for working context, and presumed "cold" (not in cpu cache) */
     ZSTD_dictUses_e dictUses;
     ZSTD_DDictHashSet* ddictSet;                    /* Hash set for multiple ddicts */
     ZSTD_refMultipleDDicts_e refMultipleDDicts;     /* User specified: if == 1, will allow references to multiple DDicts. Default == 0 (disabled) */
+    int disableHufAsm;
+    int maxBlockSizeParam;
 
     /* streaming */
     ZSTD_dStreamStage streamStage;
@@ -157,16 +183,21 @@ struct ZSTD_DCtx_s
     size_t outStart;
     size_t outEnd;
     size_t lhSize;
+#if defined(ZSTD_LEGACY_SUPPORT) && (ZSTD_LEGACY_SUPPORT>=1)
     void* legacyContext;
     U32 previousLegacyVersion;
     U32 legacyVersion;
+#endif
     U32 hostageByte;
     int noForwardProgress;
     ZSTD_bufferMode_e outBufferMode;
     ZSTD_outBuffer expectedOutBuffer;
 
     /* workspace */
-    BYTE litBuffer[ZSTD_BLOCKSIZE_MAX + WILDCOPY_OVERLENGTH];
+    BYTE* litBuffer;
+    const BYTE* litBufferEnd;
+    ZSTD_litLocation_e litBufferLocation;
+    BYTE litExtraBuffer[ZSTD_LITBUFFEREXTRASIZE + WILDCOPY_OVERLENGTH]; /* literal buffer can be split between storage within dst and within this scratch buffer */
     BYTE headerBuffer[ZSTD_FRAMEHEADERSIZE_MAX];
 
     size_t oversizedDuration;
@@ -175,8 +206,33 @@ struct ZSTD_DCtx_s
     void const* dictContentBeginForFuzzing;
     void const* dictContentEndForFuzzing;
 #endif
+
+    /* Tracing */
+#if ZSTD_TRACE
+    ZSTD_TraceCtx traceCtx;
+    size_t traceDictSize;       /* size of the dictionary installed for this frame */
+#endif
 };  /* typedef'd to ZSTD_DCtx within "zstd.h" */
 
+/**
+ * @returns the cached per-context BMI2 dispatch hint, or 0 when the build does
+ *          not use cached CPU state.
+ *
+ * Beware: this is *not* a "does the CPU support BMI2" test. When BMI2 is enabled
+ * at compile time, DYNAMIC_BMI2 is 0: the whole library is already compiled with
+ * BMI2, no separate variant exists, and this returns 0 even though the CPU does
+ * support BMI2. Only use the result as a dispatch hint passed to a lower-level
+ * BMI2/default selector. Integrations may ignore the cached hint and consult
+ * their own CPU-feature policy at that selector.
+ */
+MEM_STATIC int ZSTD_DCtx_get_bmi2(const struct ZSTD_DCtx_s *dctx) {
+#if DYNAMIC_BMI2
+    return dctx->bmi2;
+#else
+    (void)dctx;
+    return 0;
+#endif
+}
 
 /*-*******************************************************
  *  Shared internal functions
@@ -193,7 +249,7 @@ size_t ZSTD_loadDEntropy(ZSTD_entropyDTables_t* entropy,
  *  If yes, do nothing (continue on current segment).
  *  If not, classify previous segment as "external dictionary", and start a new segment.
  *  This function cannot fail. */
-void ZSTD_checkContinuity(ZSTD_DCtx* dctx, const void* dst);
+void ZSTD_checkContinuity(ZSTD_DCtx* dctx, const void* dst, size_t dstSize);
 
 
 #endif /* ZSTD_DECOMPRESS_INTERNAL_H */

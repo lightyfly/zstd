@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Yann Collet, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -14,12 +14,12 @@
 /*-*******************************************************
 *  Dependencies
 *********************************************************/
+#include "../common/allocations.h"  /* ZSTD_customMalloc, ZSTD_customFree */
 #include "../common/zstd_deps.h"   /* ZSTD_memcpy, ZSTD_memmove, ZSTD_memset */
 #include "../common/cpu.h"         /* bmi2 */
 #include "../common/mem.h"         /* low level memory routines */
 #define FSE_STATIC_LINKING_ONLY
 #include "../common/fse.h"
-#define HUF_STATIC_LINKING_ONLY
 #include "../common/huf.h"
 #include "zstd_decompress_internal.h"
 #include "zstd_ddict.h"
@@ -63,7 +63,10 @@ void ZSTD_copyDDictParameters(ZSTD_DCtx* dctx, const ZSTD_DDict* ddict)
     dctx->dictID = ddict->dictID;
     dctx->prefixStart = ddict->dictContent;
     dctx->virtualStart = ddict->dictContent;
-    dctx->dictEnd = (const BYTE*)ddict->dictContent + ddict->dictSize;
+    /* An empty DDict may have NULL content. */
+    dctx->dictEnd = ddict->dictSize != 0
+            ? (const BYTE*)ddict->dictContent + ddict->dictSize
+            : ddict->dictContent;
     dctx->previousDstEnd = dctx->dictEnd;
 #ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     dctx->dictContentBeginForFuzzing = dctx->prefixStart;
@@ -134,11 +137,36 @@ static size_t ZSTD_initDDict_internal(ZSTD_DDict* ddict,
         ZSTD_memcpy(internalBuffer, dict, dictSize);
     }
     ddict->dictSize = dictSize;
-    ddict->entropy.hufTable[0] = (HUF_DTable)((HufLog)*0x1000001);  /* cover both little and big endian */
+    ddict->entropy.hufTable[0] = (HUF_DTable)((ZSTD_HUFFDTABLE_CAPACITY_LOG)*0x1000001);  /* cover both little and big endian */
 
     /* parse dictionary content */
     FORWARD_IF_ERROR( ZSTD_loadEntropy_intoDDict(ddict, dictContentType) , "");
 
+    return 0;
+}
+
+size_t ZSTD_createDDict_advanced_internal(ZSTD_DDict** ddictPtr,
+                                          const void* dict, size_t dictSize,
+                                          ZSTD_dictLoadMethod_e dictLoadMethod,
+                                          ZSTD_dictContentType_e dictContentType,
+                                          ZSTD_customMem customMem)
+{
+    ZSTD_DDict* ddict;
+    *ddictPtr = NULL;
+    RETURN_ERROR_IF((!customMem.customAlloc) ^ (!customMem.customFree),
+                    parameter_combination_unsupported, "Invalid custom allocator");
+
+    ddict = (ZSTD_DDict*) ZSTD_customMalloc(sizeof(ZSTD_DDict), customMem);
+    RETURN_ERROR_IF(ddict == NULL, memory_allocation, "");
+    ddict->cMem = customMem;
+    {   size_t const initResult = ZSTD_initDDict_internal(ddict,
+                                        dict, dictSize,
+                                        dictLoadMethod, dictContentType);
+        if (ZSTD_isError(initResult)) {
+            ZSTD_freeDDict(ddict);
+            return initResult;
+    }   }
+    *ddictPtr = ddict;
     return 0;
 }
 
@@ -147,20 +175,11 @@ ZSTD_DDict* ZSTD_createDDict_advanced(const void* dict, size_t dictSize,
                                       ZSTD_dictContentType_e dictContentType,
                                       ZSTD_customMem customMem)
 {
-    if ((!customMem.customAlloc) ^ (!customMem.customFree)) return NULL;
-
-    {   ZSTD_DDict* const ddict = (ZSTD_DDict*) ZSTD_customMalloc(sizeof(ZSTD_DDict), customMem);
-        if (ddict == NULL) return NULL;
-        ddict->cMem = customMem;
-        {   size_t const initResult = ZSTD_initDDict_internal(ddict,
-                                            dict, dictSize,
-                                            dictLoadMethod, dictContentType);
-            if (ZSTD_isError(initResult)) {
-                ZSTD_freeDDict(ddict);
-                return NULL;
-        }   }
-        return ddict;
-    }
+    ZSTD_DDict* ddict;
+    size_t const err = ZSTD_createDDict_advanced_internal(&ddict,
+                            dict, dictSize, dictLoadMethod, dictContentType, customMem);
+    if (ZSTD_isError(err)) return NULL;
+    return ddict;
 }
 
 /*! ZSTD_createDDict() :
@@ -190,13 +209,12 @@ const ZSTD_DDict* ZSTD_initStaticDDict(
                                 ZSTD_dictLoadMethod_e dictLoadMethod,
                                 ZSTD_dictContentType_e dictContentType)
 {
-    size_t const neededSpace = sizeof(ZSTD_DDict)
-                             + (dictLoadMethod == ZSTD_dlm_byRef ? 0 : dictSize);
+    size_t const neededSpace = ZSTD_estimateDDictSize(dictSize, dictLoadMethod);
     ZSTD_DDict* const ddict = (ZSTD_DDict*)sBuffer;
     assert(sBuffer != NULL);
     assert(dict != NULL);
     if ((size_t)sBuffer & 7) return NULL;   /* 8-aligned */
-    if (sBufferSize < neededSpace) return NULL;
+    if (ZSTD_isError(neededSpace) || sBufferSize < neededSpace) return NULL;
     if (dictLoadMethod == ZSTD_dlm_byCopy) {
         ZSTD_memcpy(ddict+1, dict, dictSize);  /* local copy */
         dict = ddict+1;
@@ -224,7 +242,10 @@ size_t ZSTD_freeDDict(ZSTD_DDict* ddict)
  *  Note : dictionary created by reference using ZSTD_dlm_byRef are smaller */
 size_t ZSTD_estimateDDictSize(size_t dictSize, ZSTD_dictLoadMethod_e dictLoadMethod)
 {
-    return sizeof(ZSTD_DDict) + (dictLoadMethod == ZSTD_dlm_byRef ? 0 : dictSize);
+    if (dictLoadMethod == ZSTD_dlm_byRef) return sizeof(ZSTD_DDict);
+    RETURN_ERROR_IF(dictSize > (size_t)-1 - sizeof(ZSTD_DDict),
+                    memory_allocation, "DDict size overflow");
+    return sizeof(ZSTD_DDict) + dictSize;
 }
 
 size_t ZSTD_sizeof_DDict(const ZSTD_DDict* ddict)
@@ -240,5 +261,5 @@ size_t ZSTD_sizeof_DDict(const ZSTD_DDict* ddict)
 unsigned ZSTD_getDictID_fromDDict(const ZSTD_DDict* ddict)
 {
     if (ddict==NULL) return 0;
-    return ZSTD_getDictID_fromDict(ddict->dictContent, ddict->dictSize);
+    return ddict->dictID;
 }

@@ -1,5 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0+ OR BSD-3-Clause */
 /*
- * Copyright (c) 2016-2021, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -71,7 +72,7 @@ static uint64_t ZSTD_div64(uint64_t dividend, uint32_t divisor) {
 #endif /* ZSTD_DEPS_MATH64 */
 #endif /* ZSTD_DEPS_NEED_MATH64 */
 
-/* 
+/*
  * This is only requested when DEBUGLEVEL >= 1, meaning
  * it is disabled in production.
  * Need:
@@ -83,12 +84,12 @@ static uint64_t ZSTD_div64(uint64_t dividend, uint32_t divisor) {
 
 #include <linux/kernel.h>
 
-#define assert(x) WARN_ON((x))
+#define assert(x) WARN_ON(!(x))
 
 #endif /* ZSTD_DEPS_ASSERT */
 #endif /* ZSTD_DEPS_NEED_ASSERT */
 
-/* 
+/*
  * This is only requested when DEBUGLEVEL >= 2, meaning
  * it is disabled in production.
  * Need:
@@ -105,7 +106,7 @@ static uint64_t ZSTD_div64(uint64_t dividend, uint32_t divisor) {
 #endif /* ZSTD_DEPS_IO */
 #endif /* ZSTD_DEPS_NEED_IO */
 
-/* 
+/*
  * Only requested when MSAN is enabled.
  * Need:
  * intptr_t
@@ -114,11 +115,7 @@ static uint64_t ZSTD_div64(uint64_t dividend, uint32_t divisor) {
 #ifndef ZSTD_DEPS_STDINT
 #define ZSTD_DEPS_STDINT
 
-/*
- * The Linux Kernel doesn't provide intptr_t, only uintptr_t, which
- * is an unsigned long.
- */
-typedef long intptr_t;
+/* intptr_t already provided by ZSTD_DEPS_COMMON */
 
 #endif /* ZSTD_DEPS_STDINT */
 #endif /* ZSTD_DEPS_NEED_STDINT */

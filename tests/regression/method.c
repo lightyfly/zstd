@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2021, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -102,6 +102,9 @@ static result_t simple_compress(method_state_t* base, config_t const* config) {
      */
     if (base->data->type != data_type_file)
         return result_error(result_error_skip);
+    
+    if (config->advanced_api_only)
+        return result_error(result_error_skip);
 
     if (config->use_dictionary || config->no_pledged_src_size)
         return result_error(result_error_skip);
@@ -151,17 +154,20 @@ static result_t compress_cctx_compress(
 
     if (base->data->type != data_type_dir)
         return result_error(result_error_skip);
+    
+    if (config->advanced_api_only)
+        return result_error(result_error_skip);
 
     int const level = config_get_level(config);
-
+    result_t result;
     ZSTD_CCtx* cctx = ZSTD_createCCtx();
     ZSTD_DCtx* dctx = ZSTD_createDCtx();
     if (cctx == NULL || dctx == NULL) {
         fprintf(stderr, "context creation failed\n");
-        return result_error(result_error_system_error);
+        result = result_error(result_error_system_error);
+        goto out;
     }
 
-    result_t result;
     result_data_t data = {.total_size = 0};
     for (size_t i = 0; i < state->inputs.size; ++i) {
         data_buffer_t const input = state->inputs.buffers[i];
@@ -252,6 +258,9 @@ static void method_state_destroy(method_state_t* state) {
 
 static result_t cli_compress(method_state_t* state, config_t const* config) {
     if (config->cli_args == NULL)
+        return result_error(result_error_skip);
+
+    if (config->advanced_api_only)
         return result_error(result_error_skip);
 
     /* We don't support no pledged source size with directories. Too slow. */
@@ -523,6 +532,10 @@ static result_t old_streaming_compress_internal(
     result = result_error(result_error_skip);
     goto out;
   }
+  if (config->advanced_api_only) {
+    result = result_error(result_error_skip);
+    goto out;
+  }
   if (init_cstream(state, zcs, config, advanced, cdict ? &cd : NULL)) {
     result = result_error(result_error_compression_error);
     goto out;
@@ -651,7 +664,7 @@ method_t const old_streaming_advanced = {
 };
 
 method_t const old_streaming_cdict = {
-    .name = "old streaming cdcit",
+    .name = "old streaming cdict",
     .create = buffer_state_create,
     .compress = old_streaming_compress_cdict,
     .destroy = buffer_state_destroy,

@@ -1,12 +1,12 @@
 #ifndef SEEKABLE_H
 #define SEEKABLE_H
 
+#include <stdio.h>
+#include "zstd.h"   /* ZSTDLIB_API */
+
 #if defined (__cplusplus)
 extern "C" {
 #endif
-
-#include <stdio.h>
-#include "zstd.h"   /* ZSTDLIB_API */
 
 
 #define ZSTD_seekTableFooterSize 9
@@ -15,8 +15,8 @@ extern "C" {
 
 #define ZSTD_SEEKABLE_MAXFRAMES 0x8000000U
 
-/* Limit the maximum size to avoid any potential issues storing the compressed size */
-#define ZSTD_SEEKABLE_MAX_FRAME_DECOMPRESSED_SIZE 0x80000000U
+/* Limit maximum size to avoid potential issues storing the compressed size */
+#define ZSTD_SEEKABLE_MAX_FRAME_DECOMPRESSED_SIZE 0x40000000U
 
 /*-****************************************************************************
 *  Seekable Format
@@ -29,6 +29,7 @@ extern "C" {
 
 typedef struct ZSTD_seekable_CStream_s ZSTD_seekable_CStream;
 typedef struct ZSTD_seekable_s ZSTD_seekable;
+typedef struct ZSTD_seekTable_s ZSTD_seekTable;
 
 /*-****************************************************************************
 *  Seekable compression - HowTo
@@ -47,10 +48,19 @@ typedef struct ZSTD_seekable_s ZSTD_seekable;
 *
 *  Use ZSTD_seekable_initCStream() to initialize a ZSTD_seekable_CStream object
 *  for a new compression operation.
-*  `maxFrameSize` indicates the size at which to automatically start a new
-*  seekable frame.  `maxFrameSize == 0` implies the default maximum size.
-*  `checksumFlag` indicates whether or not the seek table should include frame
-*  checksums on the uncompressed data for verification.
+*  - `maxFrameSize` indicates the size at which to automatically start a new
+*            seekable frame.
+*            `maxFrameSize == 0` implies the default maximum size.
+*            Smaller frame sizes allow faster decompression of small segments,
+*            since retrieving a single byte requires decompression of
+*            the full frame where the byte belongs.
+*            In general, size the frames to roughly correspond to
+*            the access granularity (when it's known).
+*            But small sizes also reduce compression ratio.
+*            Avoid really tiny frame sizes (< 1 KB),
+*            that would hurt compression ratio considerably.
+*  - `checksumFlag` indicates whether or not the seek table should include frame
+*            checksums on the uncompressed data for verification.
 *  @return : a size hint for input to provide for compression, or an error code
 *            checkable with ZSTD_isError()
 *
@@ -107,12 +117,18 @@ ZSTDLIB_API size_t ZSTD_seekable_freeFrameLog(ZSTD_frameLog* fl);
 ZSTDLIB_API size_t ZSTD_seekable_logFrame(ZSTD_frameLog* fl, unsigned compressedSize, unsigned decompressedSize, unsigned checksum);
 ZSTDLIB_API size_t ZSTD_seekable_writeSeekTable(ZSTD_frameLog* fl, ZSTD_outBuffer* output);
 
+
 /*-****************************************************************************
 *  Seekable decompression - HowTo
 *  A ZSTD_seekable object is required to tracking the seekTable.
 *
 *  Call ZSTD_seekable_init* to initialize a ZSTD_seekable object with the
-*  the seek table provided in the input.
+*  seek table provided in the input. These functions may also be called again
+*  to reset the object for a new input. Resetting discards the previous input
+*  and seek table, even if initialization fails. Before the first successful
+*  initialization, or after a failed initialization, the object has no frames
+*  and decompression returns an initialization-missing error. The object may
+*  be initialized again or freed.
 *  There are three modes for ZSTD_seekable_init:
 *    - ZSTD_seekable_initBuff() : An in-memory API.  The data contained in
 *      `src` should be the entire seekable file, including the seek table.
@@ -141,9 +157,12 @@ ZSTDLIB_API size_t ZSTD_seekable_writeSeekTable(ZSTD_frameLog* fl, ZSTD_outBuffe
 *  consecutive range of data, it will efficiently retain the decompressor object
 *  and avoid redecompressing frame prefixes.  The return value is the number of
 *  bytes decompressed, or an error code checkable with ZSTD_isError().
+*  It is smaller than `dstSize` only when the data ends before
+*  `offset + dstSize`, and it is 0 when `offset` is the end of the data.
+*  An `offset` past the end of the data is an error.
 *
 *  The seek table access functions can be used to obtain the data contained
-*  in the seek table.  If frameIndex is larger than the value returned by
+*  in the seek table.  If frameIndex is greater than or equal to
 *  ZSTD_seekable_getNumFrames(), they will return error codes checkable with
 *  ZSTD_isError().  Note that since the offset access functions return
 *  unsigned long long instead of size_t, in this case they will instead return
@@ -161,13 +180,42 @@ ZSTDLIB_API size_t ZSTD_seekable_decompress(ZSTD_seekable* zs, void* dst, size_t
 ZSTDLIB_API size_t ZSTD_seekable_decompressFrame(ZSTD_seekable* zs, void* dst, size_t dstSize, unsigned frameIndex);
 
 #define ZSTD_SEEKABLE_FRAMEINDEX_TOOLARGE (0ULL-2)
-/*===== Seek Table access functions =====*/
-ZSTDLIB_API unsigned ZSTD_seekable_getNumFrames(ZSTD_seekable* const zs);
-ZSTDLIB_API unsigned long long ZSTD_seekable_getFrameCompressedOffset(ZSTD_seekable* const zs, unsigned frameIndex);
-ZSTDLIB_API unsigned long long ZSTD_seekable_getFrameDecompressedOffset(ZSTD_seekable* const zs, unsigned frameIndex);
-ZSTDLIB_API size_t ZSTD_seekable_getFrameCompressedSize(ZSTD_seekable* const zs, unsigned frameIndex);
-ZSTDLIB_API size_t ZSTD_seekable_getFrameDecompressedSize(ZSTD_seekable* const zs, unsigned frameIndex);
-ZSTDLIB_API unsigned ZSTD_seekable_offsetToFrameIndex(ZSTD_seekable* const zs, unsigned long long offset);
+/*===== Seekable seek table access functions =====*/
+ZSTDLIB_API unsigned ZSTD_seekable_getNumFrames(const ZSTD_seekable* zs);
+ZSTDLIB_API unsigned long long ZSTD_seekable_getFrameCompressedOffset(const ZSTD_seekable* zs, unsigned frameIndex);
+ZSTDLIB_API unsigned long long ZSTD_seekable_getFrameDecompressedOffset(const ZSTD_seekable* zs, unsigned frameIndex);
+ZSTDLIB_API size_t ZSTD_seekable_getFrameCompressedSize(const ZSTD_seekable* zs, unsigned frameIndex);
+ZSTDLIB_API size_t ZSTD_seekable_getFrameDecompressedSize(const ZSTD_seekable* zs, unsigned frameIndex);
+ZSTDLIB_API unsigned ZSTD_seekable_offsetToFrameIndex(const ZSTD_seekable* zs, unsigned long long offset);
+
+
+/*-****************************************************************************
+*  Direct exploitation of the seekTable
+*
+*  Memory constrained use cases that manage multiple archives
+*  benefit from retaining multiple archive seek tables
+*  without retaining a ZSTD_seekable instance for each.
+*
+*  Below API allow the above-mentioned use cases
+*  to initialize a ZSTD_seekable, extract its (smaller) ZSTD_seekTable,
+*  then throw the ZSTD_seekable away to save memory.
+*
+*  Standard ZSTD operations can then be used
+*  to decompress frames based on seek table offsets.
+******************************************************************************/
+
+/*===== Independent seek table management =====*/
+ZSTDLIB_API ZSTD_seekTable* ZSTD_seekTable_create_fromSeekable(const ZSTD_seekable* zs);
+ZSTDLIB_API size_t ZSTD_seekTable_free(ZSTD_seekTable* st);
+
+/*===== Direct seek table access functions =====*/
+ZSTDLIB_API unsigned ZSTD_seekTable_getNumFrames(const ZSTD_seekTable* st);
+ZSTDLIB_API unsigned long long ZSTD_seekTable_getFrameCompressedOffset(const ZSTD_seekTable* st, unsigned frameIndex);
+ZSTDLIB_API unsigned long long ZSTD_seekTable_getFrameDecompressedOffset(const ZSTD_seekTable* st, unsigned frameIndex);
+ZSTDLIB_API size_t ZSTD_seekTable_getFrameCompressedSize(const ZSTD_seekTable* st, unsigned frameIndex);
+ZSTDLIB_API size_t ZSTD_seekTable_getFrameDecompressedSize(const ZSTD_seekTable* st, unsigned frameIndex);
+ZSTDLIB_API unsigned ZSTD_seekTable_offsetToFrameIndex(const ZSTD_seekTable* st, unsigned long long offset);
+
 
 /*===== Seekable advanced I/O API =====*/
 typedef int(ZSTD_seekable_read)(void* opaque, void* buffer, size_t n);

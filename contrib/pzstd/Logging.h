@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-present, Facebook, Inc.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  * All rights reserved.
  *
  * This source code is licensed under both the BSD-style license (found in the
@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <mutex>
+#include <chrono>
 
 namespace pzstd {
 
